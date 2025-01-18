@@ -78,6 +78,9 @@ intro_prompt = PromptTemplate(
     template=intro_template
 )
 
+intro_chain = LLMChain(llm=llm, prompt=intro_prompt)
+
+
 external_report_template = """
     You are an expert in analyzing occupational therapy reports. Based on the external report content provided:
 
@@ -461,6 +464,7 @@ def form_view(request):
 
             request.session['selected_assessments'] = [assessment_mapping[assess] for assess in selected_assessments if assess in assessment_mapping]
 
+
         return Response({'status': 'success', 'message': 'Form data saved successfully'}, status=status.HTTP_200_OK)
     except Exception as e:
         return Response({'status': 'error', 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -469,7 +473,6 @@ def form_view(request):
 @api_view(['POST'])
 def background(request):
     try:
-        print(request.session)
         external_report_files = request.FILES.getlist('external_report')
         internal_referral_files = request.FILES.getlist('initial_referral')
 
@@ -504,7 +507,12 @@ def background(request):
         request.session['external_report_content'] = all_external_content  
         request.session['initial_referral_content'] = all_internal_content
 
-        return Response({'status': 'success', 'message': 'Form data saved successfully'}, status=status.HTTP_200_OK)
+        return Response({'status': 'success', 'message': 'Form data saved successfully',
+                         'external_report_result': external_report_result, 
+                         'initial_referral_result': initial_referral_result,
+                         'external_report_content': all_external_content,
+                         'initial_referral_content': all_internal_content}, 
+                         status=status.HTTP_200_OK)
     except Exception as e:
             return Response({'status': 'error', 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -528,7 +536,7 @@ def viewsObtained(request):
         views_result = views_chain.run({"therapist_input": therapist_input})
 
         request.session['views_result'] = views_result
-        return Response({'status': 'success', 'message': 'success'}, status=status.HTTP_200_OK)
+        return Response({'status': 'success', 'message': 'success','views_result':views_result}, status=status.HTTP_200_OK)
     except Exception as e:
             return Response({'status': 'error', 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -600,187 +608,164 @@ manual_assessment_fields = {
 
 @api_view(['POST'])
 def assessment(request):
-    data = request.data.get('assessments')
-
     if request.method == 'POST':
+        data = request.data.get('assessments')
+        print(data)
+
         fs = FileSystemStorage()
         pdf_results = {}
         manual_data = {}
         pdf_texts = {}
+        enhanced_tables = []
 
-        # Process each assessment in the provided data
+        selected_fields = []
         for idx, assessment in enumerate(data):
-            label = assessment.get('label')
-            value = assessment.get('value')
+            if assessment['type'] == 'manual':
+                fields = manual_assessment_fields.get(assessment['label'], [])
+                selected_fields.extend(fields)
 
-            if 'Manual' in label:
-                # Process manual data
-                manual_data[label] = value
+                for field in fields:
+                    field_name = field['label']
+                    manual_data[field_name] = request.POST.get(field_name, "N/A")
 
-            elif 'PDF' in label:
-                # Process PDF file - simulated since actual PDF processing isn't shown
-                # This part needs to handle PDF extraction if files are actually uploaded
-                pdf_texts[label] = value
-                pdf_results[label] = f"Processed data for {label}"
+            elif assessment['type'] == 'pdf':
+                pdf_field = f"pdf_{idx + 1}"
+                file = request.FILES.get(pdf_field)
+                if file and allowed_file(file.name):
+                    filename = secure_filename(file.name)
+                    file_path = os.path.join(fs.location, filename)
+                    file.save(file_path)
 
-        # Store results in session
+                    pdf_text = extract_text_from_pdf(file_path)
+                    pdf_texts[assessment['label']] = pdf_text
+
+                    tables = extract_tables_with_tabula(file_path)
+                    formatted_tables = deduplicate_tables(format_table_as_text(tables))
+
+                    extracted_tables = []
+                    for table in formatted_tables:
+                        response = clean_table_chain.run(table_data=table)
+                        response = response.split('```markdown')[-1].split('```')[0]
+                        try:
+                            parsed_table = parse_markdown_table(response)
+                            if parsed_table:
+                                extracted_tables.append(parsed_table)
+                        except Exception as e:
+                            print(f"Error processing table: {e}")
+
+                    pdf_results[assessment['label']] = extracted_tables
+
         request.session['pdf_results'] = pdf_results
+        request.session['cleaned_tables'] = enhanced_tables
         request.session['pdf_texts'] = pdf_texts
 
-        # Assuming additional processing and output generation code is in place
 
-        return Response({
+        assessment_input = {key: value for key, value in manual_data.items() if value != "N/A"}
+        dynamic_template = generate_dynamic_prompt(selected_fields)
+        formatted_template = dynamic_template.format(**assessment_input)
+
+        # Simulated LLMChain and PromptTemplate usage
+        assessment_prompt = "Generated prompt using the template and inputs"
+        assessment_result = "Simulated result from some LLM processing"
+
+        request.session['assessment_result'] = assessment_result
+    
+    return Response({
             'success': 'Assessment completed successfully',
             'pdf_results': pdf_results,
-            'manual_data': manual_data
+            'cleaned_tables': enhanced_tables,
+            'pdf_texts': pdf_texts,
+            'assessment_result': assessment_result
         }, status=status.HTTP_200_OK)
 
-    else:
-        # Handle non-POST requests
-        return Response({'error': 'Invalid request method. Please use POST.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
 
 
 @api_view(['POST'])
 def clinical_analysis(request):
-    if request.method == 'POST':
+    try:
         data = request.data.get('payload')
         if data is None:
             return Response({
                 'error': 'No data provided.'
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        print("Received Data:", data)  # Debug to check what's inside data
 
         selected_statements = []
         
-        # Collect all received values directly
         for key, values in data.items():
-            selected_statements.extend(values)  # Append all values directly to the list
+            selected_statements.extend(values) 
 
-        print(f'Selected Assessments are: {selected_statements}')
 
-        # Assuming `clinical_analysis_chain` is defined and ready to process the content
         clinical_analysis_content = " ".join(selected_statements)
-        print(f'Clinical Analysis Input: {clinical_analysis_content}')
         
-        # Placeholder for your analysis function - replace with actual function call
-        # Assuming clinical_analysis_chain is a function or method that takes content and returns a summary
         summary_result = clinical_analysis_chain.run({"clinical_analysis_content": clinical_analysis_content})
         request.session['clinical_analysis_result'] = summary_result  # Dummy function call for demonstration
 
-        return Response({
-            'success': 'Clinical analysis completed successfully',
-            'result': summary_result
-        }, status=status.HTTP_200_OK)
 
-    return Response({
-        'error': 'Invalid request method. Please use POST.'
-    }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+        assessment_tables = request.data.get('assessment_tables', '')
+        # cleaned_tables = session.get('cleaned_tables', '')
+        pdf_texts = request.data.get('pdf_texts', {})
 
 
-@api_view(['POST'])
-def recommendations(request):
-    intro_content = request.session.get('intro_content', '')
-    external_report_content = request.session.get('external_report_result', '')
-    initial_referral_content = request.session.get('initial_referral_result', '')
-    views_content = request.session.get('views_result', '')
-    assessment_content = request.session.get('assessment_result', '')
-    clinical_analysis_content = request.session.get('clinical_analysis_result', '')
-    summary_of_strengths_content = request.session.get('summary_of_strengths_result', '')
-    summary_of_needs_content = request.session.get('summary_of_needs_result', '')
+        appendix_result = appendix_chain.run({
+            "assessment_tables": assessment_tables,
+            "pdf_texts": pdf_texts
+        })
 
-    recommendations_result = recommendations_chain.run({
-        "intro_content": intro_content,
-        "external_report_content": external_report_content,
-        "initial_referral_content": initial_referral_content,
-        "views_content": views_content,
-        "assessment_content": assessment_content,
-        "clinical_analysis_content": clinical_analysis_content,
-        "summary_of_strengths_content": summary_of_strengths_content,
-        "summary_of_needs_content": summary_of_needs_content
-    })
-
-    request.session['recommendations_result'] = recommendations_result
-
-    return Response({
-            'success': 'Recommendations processed successfully.',
-        }, status=status.HTTP_200_OK)
+        request.session['appendix_result'] = appendix_result
 
 
 
 
+        
+        intro_result = intro_chain.run({
+            "child_dob": request.data.get('child_dob'), "requester": request.data.get('requester'),
+            "pronoun": request.data.get('pronoun'), "assesment_administered": request.data.get('assesment_administered'),
+            "assesment_time": request.data.get('assesment_time'), "meet_teacher": request.data.get('meet_teacher'),
+            "meet_parent": request.data.get('meet_parent'), "meet_therapy_team": request.data.get('meet_therapy_team'),
+            "lessons_observed": request.data.get('lessons_observed'), "sensory_profile": request.data.get('sensory_profile'),
+            "parent_assesment": request.data.get('parent_assesment')
+        })
+        intro_content = format_report_content(intro_result)
+        # print('\n\Intro Section : ', intro_content)
 
-@api_view(['POST'])
-def appendix(request):
-    assessment_tables = request.session.get('assessment_tables', '')
-    # cleaned_tables = session.get('cleaned_tables', '')
-    pdf_texts = request.session.get('pdf_texts', {})
+        external_report_result = request.data.get('external_report_result', '')
+        external_report_content = format_report_content(external_report_result)
+        # print('\n\nBackground Section External : ', external_report_content)
 
+        initial_referral_result = request.data.get('initial_referral_result', '')
+        initial_referral_content = format_report_content(initial_referral_result)
+        # print('\n\nBackground Section Internal: ', initial_referral_content)
 
-    appendix_result = appendix_chain.run({
-        "assessment_tables": assessment_tables,
-        "pdf_texts": pdf_texts
-    })
+        views_result = request.data.get('views_result', '')
+        views_content = format_report_content(views_result)
+        # print('\n\nViews Section : ', views_content)
 
-    request.session['appendix_result'] = appendix_result
+        cleaned_tables = request.data.get('cleaned_tables', [])
+        # print('\n\nPDF Results Tables : ', cleaned_tables)
 
-    return Response({
-            'success': 'Recommendations processed successfully.',
-        }, status=status.HTTP_200_OK)
+        pdf_texts = request.data.get('pdf_texts', '')
+        # print('\n\nPDF Results Tables : ', pdf_texts)
 
+        assessment_content = request.data.get('assessment_result', '')
+        # print('\n\nAsessment Content : ', assessment_content)
+    
+        assessment_tables = parse_assessment_tables(assessment_content)
+        # print(json.dumps(assessment_data, indent=4))
+        print('\n\nAsessment Tables : ', json.dumps(assessment_tables, indent=4))
 
+        clinical_analysis_content = format_report_content(summary_result)
+        # print('\nClinical Analysis Content : ', clinical_analysis_content)
 
+        summary_of_strengths_result = summary_of_strengths_chain.run({"assessment_content": assessment_content})
+        summary_of_strengths_content = format_report_content(summary_of_strengths_result)
 
-@api_view(['POST'])
-def report(request):
-    intro_chain = LLMChain(llm=llm, prompt=intro_prompt)
-    intro_result = intro_chain.run({
-        "child_dob": request.session['child_dob'], "requester": request.session['requester'],
-        "pronoun": request.session['pronoun'], "assesment_administered": request.session['assesment_administered'],
-        "assesment_time": request.session['assesment_time'], "meet_teacher": request.session['meet_teacher'],
-        "meet_parent": request.session['meet_parent'], "meet_therapy_team": request.session['meet_therapy_team'],
-        "lessons_observed": request.session['lessons_observed'], "sensory_profile": request.session['sensory_profile'],
-        "parent_assesment": request.session['parent_assesment']
-    })
-    intro_content = format_report_content(intro_result)
-    # print('\n\Intro Section : ', intro_content)
+        summary_of_needs_result = summary_of_needs_chain.run({"assessment_content": assessment_content})
+        summary_of_needs_content = format_report_content(summary_of_needs_result)
 
-    external_report_result = request.session.get('external_report_result', '')
-    external_report_content = format_report_content(external_report_result)
-    # print('\n\nBackground Section External : ', external_report_content)
-
-    initial_referral_result = request.session.get('initial_referral_result', '')
-    initial_referral_content = format_report_content(initial_referral_result)
-    # print('\n\nBackground Section Internal: ', initial_referral_content)
-
-    views_result = request.session.get('views_result', '')
-    views_content = format_report_content(views_result)
-    # print('\n\nViews Section : ', views_content)
-
-    cleaned_tables = request.session.get('cleaned_tables', [])
-    # print('\n\nPDF Results Tables : ', cleaned_tables)
-
-    pdf_texts = request.session.get('pdf_texts', '')
-    # print('\n\nPDF Results Tables : ', pdf_texts)
-
-    assessment_content = request.session.get('assessment_result', '')
-    # print('\n\nAsessment Content : ', assessment_content)
- 
-    assessment_tables = parse_assessment_tables(assessment_content)
-    # print(json.dumps(assessment_data, indent=4))
-    print('\n\nAsessment Tables : ', json.dumps(assessment_tables, indent=4))
-
-    clinical_analysis_result = request.session.get('clinical_analysis_result', '')
-    clinical_analysis_content = format_report_content(clinical_analysis_result)
-    # print('\nClinical Analysis Content : ', clinical_analysis_content)
-
-    summary_of_strengths_result = summary_of_strengths_chain.run({"assessment_content": assessment_content})
-    summary_of_strengths_content = format_report_content(summary_of_strengths_result)
-
-    summary_of_needs_result = summary_of_needs_chain.run({"assessment_content": assessment_content})
-    summary_of_needs_content = format_report_content(summary_of_needs_result)
-
-    recommendations_result = recommendations_chain.run({
+        recommendations_result = recommendations_chain.run({
         "intro_content": intro_content,
         "external_report_content": external_report_content,
         "initial_referral_content": initial_referral_content,
@@ -790,27 +775,31 @@ def report(request):
         "summary_of_strengths_content": summary_of_strengths_content,
         "summary_of_needs_content": summary_of_needs_content,
     })
-    recommendations_content = format_report_content(recommendations_result)
+        recommendations_content = format_report_content(recommendations_result)
 
-    appendix_result = appendix_chain.run({
-        "pdf_texts": pdf_texts,
-        "assessment_tables": assessment_tables
-    })
-    appendix_content = format_report_content(appendix_result)
-    
-    return Response({
-        'success': 'Recommendations processed successfully.',
-        intro_content: intro_content,
-        external_report_content: external_report_content,
-        initial_referral_content: initial_referral_content,
-        views_content: views_content,
-        cleaned_tables: cleaned_tables,
-        clinical_analysis_content: clinical_analysis_content,
-        summary_of_strengths_content: summary_of_strengths_content,
-        summary_of_needs_content: summary_of_needs_content,
-        recommendations_content: recommendations_content,
-        appendix_content: appendix_content
-        }, status=status.HTTP_200_OK)
-
+        appendix_result = appendix_chain.run({
+            "pdf_texts": pdf_texts,
+            "assessment_tables": assessment_tables
+        })
+        appendix_content = format_report_content(appendix_result)
+        
+        return Response({
+            'success': 'Recommendations processed successfully.',
+            'intro_content': intro_content,
+            'external_report_content': external_report_content,
+            'initial_referral_content': initial_referral_content,
+            'views_content': views_content,
+            'cleaned_tables': cleaned_tables,
+            'clinical_analysis_content': clinical_analysis_content,
+            'summary_of_strengths_content': summary_of_strengths_content,
+            'summary_of_needs_content': summary_of_needs_content,
+            'recommendations_content': recommendations_content,
+            'appendix_content': appendix_content
+            }, status=status.HTTP_200_OK)
+    except Exception as e:
+        print('Error occurred during processing: ', str(e))
+        return Response({
+            'error': 'An error occurred during processing.'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
