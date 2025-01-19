@@ -3,7 +3,7 @@ from rest_framework.response import Response #type: ignore
 from rest_framework.decorators import api_view, permission_classes  #type: ignore
 from datetime import datetime, timedelta
 from rest_framework import status
-from accounts.auth_jwt import decode_jwt_token, generate_jwt_token
+from accounts.auth_jwt import decode_jwt_token, generate_jwt_token, validate_token
 from django.http import JsonResponse
 from django.core.files.storage import FileSystemStorage
 
@@ -19,8 +19,8 @@ import pdfplumber
 from werkzeug.utils import secure_filename
 import redis
 import json
-from .utilss.checkbox_options import checkbox_statements
-from .utilss.helper_functions import format_report_content, extract_text_from_pdf, allowed_file, extract_tables_with_tabula, format_table_as_text, deduplicate_tables, parse_markdown_table, parse_assessment_tables, format_report_content
+from .utils.checkbox_options import checkbox_statements
+from .utils.helper_functions import format_report_content, extract_text_from_pdf, allowed_file, extract_tables_with_tabula, format_table_as_text, deduplicate_tables, parse_markdown_table, parse_assessment_tables, format_report_content
 
 
 
@@ -473,6 +473,10 @@ def form_view(request):
 @api_view(['POST'])
 def background(request):
     try:
+        is_valid, decoded_or_error = validate_token(request)
+        if not is_valid:
+            return JsonResponse(decoded_or_error, status=status.HTTP_401_UNAUTHORIZED)
+
         external_report_files = request.FILES.getlist('external_report')
         internal_referral_files = request.FILES.getlist('initial_referral')
 
@@ -522,6 +526,10 @@ def background(request):
 @api_view(['POST'])
 def viewsObtained(request):
     try:
+        is_valid, decoded_or_error = validate_token(request)
+        if not is_valid:
+            return JsonResponse(decoded_or_error, status=status.HTTP_401_UNAUTHORIZED)
+        
         parent_input = request.data.get('parent_input')
         teacher_input = request.data.get('teacher_input')
         other_input = request.data.get('other_input')
@@ -609,6 +617,9 @@ manual_assessment_fields = {
 @api_view(['POST'])
 def assessment(request):
     if request.method == 'POST':
+        is_valid, decoded_or_error = validate_token(request)
+        if not is_valid:
+            return JsonResponse(decoded_or_error, status=status.HTTP_401_UNAUTHORIZED)
         data = request.data.get('assessments')
         print(data)
 
@@ -683,8 +694,11 @@ def assessment(request):
 
 
 @api_view(['POST'])
-def clinical_analysis(request):
+def generate_report(request):
     try:
+        is_valid, decoded_or_error = validate_token(request)
+        if not is_valid:
+            return JsonResponse(decoded_or_error, status=status.HTTP_401_UNAUTHORIZED)
         data = request.data.get('payload')
         if data is None:
             return Response({
