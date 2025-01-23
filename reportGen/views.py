@@ -1,207 +1,22 @@
-from accounts.models import User, ContactUs
+from accounts.models import User
 from rest_framework.response import Response #type: ignore
-from rest_framework.decorators import api_view, permission_classes  #type: ignore
-from datetime import datetime, timedelta
+from rest_framework.decorators import api_view  #type: ignore
 from rest_framework import status
 from accounts.auth_jwt import decode_jwt_token, generate_jwt_token, validate_token
 from django.http import JsonResponse
 from django.core.files.storage import FileSystemStorage
-
-from dotenv import load_dotenv
 import os
-import openai
-import fitz
-import secrets
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from langchain.chat_models import ChatOpenAI
-import pdfplumber
 from werkzeug.utils import secure_filename
-import redis
 import json
-from .utils.checkbox_options import checkbox_statements
 from .utils.helper_functions import format_report_content, extract_text_from_pdf, allowed_file, extract_tables_with_tabula, format_table_as_text, deduplicate_tables, parse_markdown_table, parse_assessment_tables, format_report_content
 
+import report_processing
 
 
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # ALLOWED_EXTENSIONS = {'pdf'}
-
-
-load_dotenv()
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-llm = ChatOpenAI(model="gpt-4o-mini")
-
-intro_template = """
-    Assume you are an expert in writing introduction for post-therapy reports.
-    Your task is to generate an Introduction based on the following details:
-
-    - child_dob = {child_dob} 
-    - requester = {requester}
-    - pronoun = {pronoun}
-    - assesment_administered = {assesment_administered}
-    - assesment_time = {assesment_time}
-    - meet_teacher = {meet_teacher}
-    - meet_parent = {meet_parent}
-    - meet_therapy_team = {meet_therapy_team}
-    - lessons_observed = {lessons_observed}
-    - sensory_profile = {sensory_profile}
-    - parent_assesment = {parent_assesment}
-
-    your response should adhere to the following format:
-    
-     An occupational therapy assessment was requested by child's 'requester'.
-
-     This assessment will focus on analyzing the impact of 'child's name' motor, sensory, perceptual, and functional needs on 'pronoun' everyday activities and what needs to be in place to enable 'pronoun' to adequately access, learn, and progress with all the academic, social, personal, and independence demands expected within an educational setting.
-
-     In line with the College of Occupational Therapy (COT) guidelines, the assessment follows a top-down approach. This means that the individual's abilities to carry out daily life tasks (occupational performance) are primarily considered.  In children and young people these consist of their ability to engage and participate in activities relating to learning, personal care, play, social interaction and activities, and functioning at home, school and the community.
-
-     However, when working with children who often present with complex and overlapping difficulties the underlying performance components (motor, sensory, perception and volition) are equally important in understanding the ways in which performance components (foundation skills) interfere with occupational and role performance.  This assessment specifically focuses on the child's role as a learner and how foundation skills impact on their ability to access learning opportunities. 
-
-     I met 'child's name' at 'assesment_administered' where I
-        • Observed 'pronoun' in 'lessons_observed' lessons
-        • Met with 'pronoun' teacher (if 'meet_teacher' = Yes) (If no then leave out)
-        • The teacher completed the Sensory Profile: 2nd edition (if 'sensory_profile' = Yes) (If no then leave out)
-        • Met with the school therapy team (if 'meet_therapy_team' = Yes) (If no then leave out)
-        • Met with (if 'meet_parent' = yes) (If no then leave out)
-
-    REMEBER above format is just an example, you should return this type of response.
-"""
-intro_prompt = PromptTemplate(
-    input_variables=["child_dob", "requester", "pronoun", "assesment_administered", 
-                     "assesment_time", "meet_teacher", "meet_parent", "meet_therapy_team", 
-                     "lessons_observed", "sensory_profile", "parent_assesment"],
-    template=intro_template
-)
-
-intro_chain = LLMChain(llm=llm, prompt=intro_prompt)
-
-
-external_report_template = """
-    You are an expert in analyzing occupational therapy reports. Based on the external report content provided:
-
-    External Report Content: {external_report_content}
-
-    There could be multiple reports content given. From each report,
-
-    Please extract the following details:
-    - Author and designation.
-    - Date of the report.
-    - Summary of conclusions and recommendations.
-
-    Your response for each external report should adhere to the following format:
-
-    Report name:
-     Author: [Author's name], [Designation]
-     Date of Report: [Date]
-     Summary of Conclusions and Recommendations: [Summary here]
-    Report name:
-     Author: [Author's name], [Designation]
-     Date of Report: [Date]
-     Summary of Conclusions and Recommendations: [Summary here]
-    ...
-
-     Generated summary should be of more than 200 words.
-     Name of report should be in bold.
-"""
-
-external_report_prompt = PromptTemplate(
-    input_variables=["external_report_content"],
-    template=external_report_template
-)
-
-initial_referral_template = """
-    You are an expert in analyzing occupational therapy reports. Given the initial internal referral content:
-
-    Initial Internal Referral Content: {initial_referral_content}
-
-    There could be multiple reports content given. From each report,
-
-    Please summarize each described point into separate paragraphs containing more than 100 words.
-    - Summarize previous school's attendance, current school, and current school year. 
-    - Summarize other professionals involved. 
-    - Summarize family structure.
-    - Summarize answers to the following questions:
-            - Who lives with your child at present?
-            - How do your child's difficulties impact upon the family?
-            - Have there been any major changes in the family? (e.g., divorce/separation; new baby; deaths; frequent moves; change of schools, etc.). If so, please provide details about the event, when it happened, and the impact it had on your child and/or family:
-    - Summarize emotional regulation.
-    - Summarize Play section.
-    - Summarize Self-care section.
-
-    Instructions to follow:
-    - Replace child's first name with "Rxx". Ignore all phone numbers, email addresses, home address, school address, child’s surname, parents' names and surnames, date of birth, current SENCO, all GP info.
-    - From date of birth and today's date, work out the child's age.
-    - Use child's preferred pronouns throughout the document.
-
-    Your response for each initial internal referral report should adhere to the following format:
-    Report name:
-        summary
-        summary
-        summary
-        ...
-
-    Report name:
-        summary
-        summary
-        summary
-        ...
-    
-    ....
-
-
-    DONOT give any type of heading in response except report name, only return report name and paragraphs.
-
-"""
-
-initial_referral_prompt = PromptTemplate(
-    input_variables=["initial_referral_content"],
-    template=initial_referral_template
-)
-
-
-
-views_template = """
-    Assume you are an expert in writing Views for post therapy reports. Your task is to generate a summary of parent views, teacher views, and other views
-    based on the following therapist input:
-
-    - Therapist Input: {therapist_input}
-
-    Your response should adhere to the following format:
-
-    - Parent Views: [parent views]
-    - Teacher Views: [teacher views]
-    - Other Views: [other views]
-"""
-
-views_prompt = PromptTemplate(
-    input_variables=["therapist_input"], 
-    template=views_template
-)
-
-
-clean_tables_prompt_template = """
-    The following table has some junk data and extra content. Please clean the table and only return structured rows and columns with proper alignment. Remove any unnecessary or repeated data.
-    some tables may appear twice, so all tables should appear once do not reapeat same table twice.
-
-    Raw Data:
-    {table_data}
-
-    your response should adhere to the following format:
-
-        Cleaned Structured Table,
-        Cleaned Structured Table,
-        ...
-
-    return tables in markdowns.
-"""
-prompt = PromptTemplate(input_variables=["table"], template=clean_tables_prompt_template)
-
-clean_table_chain = LLMChain(llm=llm, prompt=prompt)
 
 def generate_dynamic_prompt(selected_fields):
     dynamic_template = """
@@ -255,182 +70,6 @@ def generate_dynamic_prompt(selected_fields):
     return dynamic_template
 
 
-clinical_analysis_template = """
-        Assume you are a specialist in generating summary of clinical assesments based on the sentences. Given the sentences:
-
-        sentences : {clinical_analysis_content}
-
-        your task is to Summarize each sentence in paragaraph of more than 120 words, to provide an overview of the clinical findings.
-
-        For every sentence summarise in such a way that:
-            - Give heading for each sentence.
-            - First define the selected sentence.
-            - gives 3 implications for children of this child's age group.
-
-        your response should adhere to the following format:
-
-            summary,
-            implications
-            summary,
-            implications
-            ...
-        
-"""
-
-clinical_analysis_prompt = PromptTemplate(
-    input_variables=["clinical_analysis_content"],
-    template=clinical_analysis_template
-)
-clinical_analysis_chain = LLMChain(llm=llm, prompt=clinical_analysis_prompt)
-
-summary_of_strengths_template = """
-    Assume you are an expert in identifying sentences from asessment's content based on keywords. Given the Assessment content:
-
-    Assessment content={assessment_content}
-
-    Based on the following assessment contents, generate a summary of strengths by identifying sentences containing specific keywords:
-    Keywords: 
-        - Above average, 
-        - Responds just like the majority of others, 
-        - Average, 
-        - Similar to Most People.
-
-    summarise each sentence into seperate paragraph containing more than 100 words.
-
-    your response should adhere to the following format:
-        summary
-        summary
-        ...
-
-    DONOT give any type of heading in response, only return paragraphs.
-"""
-
-summary_of_strengths_prompt = PromptTemplate(
-    input_variables=["assessment_content"],
-    template=summary_of_strengths_template
-)
-
-summary_of_strengths_chain = LLMChain(llm=llm, prompt=summary_of_strengths_prompt)
-
-summary_of_needs_template = """
-    Assume you are an expert in identifying sentences from asessment's content based on keywords. Given the Assessment content:
-
-    Assessment content={assessment_content}
-
-    Based on the following assessment content, generate a summary of needs by identifying sentences containing specific keywords:
-    Keywords: 
-        - Below average, 
-        - Very low, 
-        - Well-Below Average, 
-        - Less than most people.
-    
-    summarise each sentence into seperate paragraph containing more than 100 words.
-
-    your response should adhere to the following format:
-        summary
-        summary
-        ...
-
-    DONOT give any type of heading in response, only return paragraphs.
-"""
-
-summary_of_needs_prompt = PromptTemplate(
-    input_variables=['assessment_content'],
-    template=summary_of_needs_template
-)
-
-summary_of_needs_chain = LLMChain(llm=llm, prompt=summary_of_needs_prompt)
-
-recommendations_template = """
-        Assume you are an expert in occupational therapy and creating client-specific recommendations.
-        Based on the following data from all sections of the report:
-
-            Introduction:
-            {intro_content}
-
-            External Report:
-            {external_report_content}
-
-            Initial Referral:
-            {initial_referral_content}
-
-            Views:
-            {views_content}
-
-            Assessment:
-            {assessment_content}
-
-            Clinical Analysis:
-            {clinical_analysis_content}
-
-            Strengths:
-            {summary_of_strengths_content}
-
-            Needs:
-            {summary_of_needs_content}
-
-        Generate:
-        1. A conclusion.
-        2. Specific, measurable, achievable, realistic OT-specific goals for the next year, 6 months, and 3 months.
-        3. Goals for school and home.
-        4. Individualized recommendations for occupational therapy input.
-        5. Reasonable accommodations and adjustments in lessons, and the wider school environment (e.g., lunch, PE, break times).
-"""
-
-recommendations_prompt = PromptTemplate(
-    input_variables=[
-        "intro_content", "external_report_content", "initial_referral_content", 
-        "views_content", "assessment_content", "clinical_analysis_content", 
-        "summary_of_strengths_content", "summary_of_needs_content"
-    ],
-    template=recommendations_template
-)
-
-recommendations_chain = LLMChain(llm=llm, prompt=recommendations_prompt)
-
-
-appendix_template = """
-        Assume you are an expert in occupational therapy and creating appendix.
-        Based on the following data from assessment section of the report:
-
-            pdf assessments:
-            {pdf_texts}
-
-            Tabular assessments:
-            {assessment_tables}
-
-        There are two type of assessments contnt given one is pdf assessments for which content is extracted from pdf's,
-        And second is Tabular assessments content whose data is presented into tabular form.
-        There could be more than one assessments for both types.
-
-        Your task is to extract these details from each assessment from the given content:
-            - Name of the assesment.
-            - Author.
-            - Date of Publication and short description who this assessment is for and what the assessment is for.
-
-        Your response should adhere to the following format:
-            1- Name of the Assessment: [Assessments name]
-                Author: [Author's Name]
-                Date of Publication: [Publication Date]
-                Target Audience and Purpose: [Description of who the assessment is intended for, e.g., students, employees, etc. Brief description of the assessment's goals and what it aims to measure or evaluate.] 
-            2- Name of the Assessment: [Assessments name]
-                Author: [Author's Name]
-                Date of Publication: [Publication Date]
-                Target Audience and Purpose: [Description of who the assessment is intended for, e.g., students, employees, etc. Brief description of the assessment's goals and what it aims to measure or evaluate.] 
-            ...
-
-        Assessments name should be in bold.
-        If some detail does not found in the given content skip it and return only available details.
-"""
-
-appendix_prompt = PromptTemplate(
-    input_variables=[
-        "pdf_texts", "assessment_tables"
-    ],
-    template=appendix_template
-)
-
-appendix_chain = LLMChain(llm=llm, prompt=appendix_prompt)
 
 
 @api_view(['POST'])
@@ -499,11 +138,9 @@ def background(request):
                 
                 all_internal_content += f"{file.filename}:\n{content}\n\n"
 
-        external_report_chain = LLMChain(llm=llm, prompt=external_report_prompt)
-        external_report_result = external_report_chain.run({"external_report_content": all_external_content})
+        external_report_result = report_processing.external_report(all_external_content)
 
-        initial_referral_chain = LLMChain(llm=llm, prompt=initial_referral_prompt)
-        initial_referral_result = initial_referral_chain.run({"initial_referral_content": all_internal_content})
+        initial_referral_result = report_processing.intinal_report(all_internal_content)
 
         request.session['external_report_result'] = external_report_result
         request.session['initial_referral_result'] = initial_referral_result
@@ -540,8 +177,7 @@ def viewsObtained(request):
         Other Views: {other_input}
         """
 
-        views_chain = LLMChain(llm=llm, prompt=views_prompt)
-        views_result = views_chain.run({"therapist_input": therapist_input})
+        views_result = report_processing.views_LLm(therapist_input)
 
         request.session['views_result'] = views_result
         return Response({'status': 'success', 'message': 'success','views_result':views_result}, status=status.HTTP_200_OK)
@@ -655,7 +291,7 @@ def assessment(request):
 
                     extracted_tables = []
                     for table in formatted_tables:
-                        response = clean_table_chain.run(table_data=table)
+                        response = report_processing.clean_table_LLM(table)
                         response = response.split('```markdown')[-1].split('```')[0]
                         try:
                             parsed_table = parse_markdown_table(response)
@@ -675,7 +311,6 @@ def assessment(request):
         dynamic_template = generate_dynamic_prompt(selected_fields)
         formatted_template = dynamic_template.format(**assessment_input)
 
-        # Simulated LLMChain and PromptTemplate usage
         assessment_prompt = "Generated prompt using the template and inputs"
         assessment_result = "Simulated result from some LLM processing"
 
@@ -714,7 +349,9 @@ def generate_report(request):
 
         clinical_analysis_content = " ".join(selected_statements)
         
-        summary_result = clinical_analysis_chain.run({"clinical_analysis_content": clinical_analysis_content})
+        summary_result = report_processing.clinical_LLM(clinical_analysis_content)
+
+
         request.session['clinical_analysis_result'] = summary_result  # Dummy function call for demonstration
 
 
@@ -723,10 +360,8 @@ def generate_report(request):
         pdf_texts = request.data.get('pdf_texts', {})
 
 
-        appendix_result = appendix_chain.run({
-            "assessment_tables": assessment_tables,
-            "pdf_texts": pdf_texts
-        })
+        appendix_result = report_processing.appendix_LLM(assessment_tables, pdf_texts
+        )
 
         request.session['appendix_result'] = appendix_result
 
@@ -734,14 +369,8 @@ def generate_report(request):
 
 
         
-        intro_result = intro_chain.run({
-            "child_dob": request.data.get('child_dob'), "requester": request.data.get('requester'),
-            "pronoun": request.data.get('pronoun'), "assesment_administered": request.data.get('assesment_administered'),
-            "assesment_time": request.data.get('assesment_time'), "meet_teacher": request.data.get('meet_teacher'),
-            "meet_parent": request.data.get('meet_parent'), "meet_therapy_team": request.data.get('meet_therapy_team'),
-            "lessons_observed": request.data.get('lessons_observed'), "sensory_profile": request.data.get('sensory_profile'),
-            "parent_assesment": request.data.get('parent_assesment')
-        })
+        intro_result = report_processing.intro_LLm(request)
+
         intro_content = format_report_content(intro_result)
         # print('\n\Intro Section : ', intro_content)
 
@@ -773,28 +402,16 @@ def generate_report(request):
         clinical_analysis_content = format_report_content(summary_result)
         # print('\nClinical Analysis Content : ', clinical_analysis_content)
 
-        summary_of_strengths_result = summary_of_strengths_chain.run({"assessment_content": assessment_content})
+        summary_of_strengths_result = report_processing.summary_of_strength(assessment_content)
         summary_of_strengths_content = format_report_content(summary_of_strengths_result)
 
-        summary_of_needs_result = summary_of_needs_chain.run({"assessment_content": assessment_content})
+        summary_of_needs_result = report_processing.summary_of_need(assessment_content)
         summary_of_needs_content = format_report_content(summary_of_needs_result)
 
-        recommendations_result = recommendations_chain.run({
-        "intro_content": intro_content,
-        "external_report_content": external_report_content,
-        "initial_referral_content": initial_referral_content,
-        "views_content": views_content,
-        "assessment_content": assessment_content,
-        "clinical_analysis_content": clinical_analysis_content,
-        "summary_of_strengths_content": summary_of_strengths_content,
-        "summary_of_needs_content": summary_of_needs_content,
-    })
+        recommendations_result = report_processing.recommendation_LLM(intro_content,external_report_content,initial_referral_content,views_content,assessment_content,clinical_analysis_content,summary_of_strengths_content,summary_of_needs_content)
         recommendations_content = format_report_content(recommendations_result)
 
-        appendix_result = appendix_chain.run({
-            "pdf_texts": pdf_texts,
-            "assessment_tables": assessment_tables
-        })
+        appendix_result = report_processing.appendix_LLM(assessment_tables,pdf_texts)
         appendix_content = format_report_content(appendix_result)
         
         return Response({
